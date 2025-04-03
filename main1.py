@@ -28,6 +28,18 @@ class NavigationSystem:
     def _frames_exist(self):
         return len([f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')]) > 0
     
+    def _get_processed_frames(self):
+        """Get set of frame indices that have already been processed"""
+        processed = set()
+        for f in os.listdir(self.output_dir):
+            if f.startswith('frame_') and f.endswith('.jpg'):
+                try:
+                    frame_idx = int(f[6:-4])  # Extract number from 'frame_XXXXX.jpg'
+                    processed.add(frame_idx)
+                except ValueError:
+                    continue
+        return processed
+
     def _extract_frames(self, target_fps=6):
         cap = cv2.VideoCapture(self.video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -86,22 +98,68 @@ class NavigationSystem:
                       f"ETA: {stats['eta']}")
         print(f"\r{progress_bar} {status_line}", end='', flush=True)
 
+    def _get_centroid(self, mask):
+        """Calculate centroid of a mask"""
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        
+        # Get the largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        
+        if M["m00"] == 0:
+            return None
+            
+        cX = int(M["m10"] / M["m00"])
+        cY = int(M["m01"] / M["m00"])
+        return (cX, cY)
+
     def process_frame(self, frame, frame_idx):
         try:
             # Semantic segmentation
-            segmented = self.segmenter.segment(frame)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            segmented = self.segmenter.segment(frame_rgb)
             masks = self.segmenter.get_masks(segmented)
             
             # Depth and collision detection
             depth_map = self._get_depth_map(frame, frame_idx)
-            status, distance, _ = self.detector.check_collision(frame, frame_idx, masks)
+            status, distance, _ = self.detector.check_collision(frame, frame_idx)
             
-            # Visualizations
-            collision_vis = self.detector.visualize(frame, depth_map, status.split('-')[0].strip(), distance)
-            semantic_vis = self.segmenter.visualize(frame, segmented)
+            # Create visualizations
+            semantic_vis = self.segmenter.visualize(frame_rgb, segmented)
+            semantic_vis = cv2.cvtColor(semantic_vis, cv2.COLOR_RGB2BGR)
+            
+            # Add class and distance text at detection locations (without black box)
+            for class_name, (mask, min_distance) in masks.items():
+                if class_name != 'background':
+                    centroid = self._get_centroid(mask)
+                    if centroid:
+                        text = f"{class_name}: {min_distance:.1f}m"
+                        # Draw white text with black outline for visibility
+                        cv2.putText(semantic_vis, text, (centroid[0], centroid[1]), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)  # Black outline (thicker)
+                        cv2.putText(semantic_vis, text, (centroid[0], centroid[1]), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)  # White text
+            
+            # Rest of the visualization code remains the same...
+            depth_vis = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
+            depth_vis = cv2.applyColorMap(depth_vis.astype(np.uint8), cv2.COLORMAP_JET)
+            h, w = frame.shape[:2]
+            depth_vis_resized = cv2.resize(depth_vis, (w, h))
+            
+            # Add white ROI box to depth map
+            roi_coords = self.detector._dynamic_roi(frame.shape)
+            x_s, x_e, y_s, y_e = roi_coords
+            cv2.rectangle(depth_vis_resized, (x_s, y_s), (x_e, y_e), (255, 255, 255), 3)
+            
+            # Add status text to depth map
+            status_text = f"{status} | {distance:.1f}m"
+            cv2.putText(depth_vis_resized, status_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
             # Combine views
-            combined = np.hstack((collision_vis, semantic_vis))
+            combined = np.hstack((semantic_vis, depth_vis_resized))
             cv2.imwrite(os.path.join(self.output_dir, f"frame_{frame_idx:05d}.jpg"), combined)
             
             # Update progress
@@ -110,10 +168,10 @@ class NavigationSystem:
             self._display_progress(stats)
             
             return combined, status
+            
         except Exception as e:
             print(f"\nError processing frame {frame_idx}: {str(e)}")
             return frame, "ERROR"
-
     def run(self):
         # Initialize progress tracking
         self.start_time = time.time()
@@ -125,10 +183,20 @@ class NavigationSystem:
             frame_files = sorted([f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')])
             self.total_frames = len(frame_files)
         
-        print(f"\nProcessing {self.total_frames} frames...")
+        # Get already processed frames
+        processed_frames = self._get_processed_frames()
+        initial_processed = len(processed_frames)
+        self.processed_frames = initial_processed
+        
+        print(f"\nFound {initial_processed} already processed frames. Resuming processing...")
+        print(f"Processing {self.total_frames - initial_processed} remaining frames out of {self.total_frames} total...")
         
         frame_files = sorted([f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')])
         for frame_idx, frame_file in enumerate(frame_files):
+            # Skip already processed frames
+            if frame_idx in processed_frames:
+                continue
+                
             frame = cv2.imread(os.path.join(self.frames_dir, frame_file))
             if frame is None: 
                 print(f"\nFailed to read frame {frame_file}")
@@ -142,7 +210,9 @@ class NavigationSystem:
         
         # Clear progress line and print completion
         print("\n" + " " * 100 + "\r", end='')  # Clear progress line
-        print(f"Processing complete. Total time: {timedelta(seconds=int(time.time() - self.start_time))}")
+        total_time = timedelta(seconds=int(time.time() - self.start_time))
+        print(f"Processing complete. Total time: {total_time}")
+        print(f"Processed {self.processed_frames - initial_processed} new frames (total {self.processed_frames}/{self.total_frames})")
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
