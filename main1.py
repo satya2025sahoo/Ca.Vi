@@ -1,194 +1,220 @@
-import os
 import cv2
-import argparse
 import numpy as np
-from semantic_segmenter import SemanticSegmenter
-from object_tracker import ObjectTracker
-from object_detector import ObjectDetector
-from navigator import Navigator
-from map_generator import MapGenerator
-from collision_detector import CollisionDetector
+import os
+import time
+from datetime import datetime, timedelta
+from collision_detector1 import EnhancedCollisionDetector
+from semantic_segmenter1 import AccurateSegmenter
 
-def extract_frames(video_path, frame_dir, target_fps=6):
-    if not os.path.exists(frame_dir):
-        os.makedirs(frame_dir)
-    if os.listdir(frame_dir):
-        print("✅ Frames already exist. Skipping extraction.")
-        return
-    print("📽 Extracting frames from video...")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("❌ Error: Unable to open video file!")
-        return
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_interval = max(1, round(original_fps / target_fps))
-    frame_count = 0
-    saved_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_count % frame_interval == 0:
-            frame_path = os.path.join(frame_dir, f"frame_{saved_count:04d}.jpg")
-            cv2.imwrite(frame_path, frame)
-            saved_count += 1
-        frame_count += 1
-    cap.release()
-    print(f"✅ Frame extraction complete! {saved_count} frames saved.")
+class NavigationSystem:
+    def __init__(self, video_path="video.mp4", output_dir="output", frames_dir="frames", depth_dir="depth_maps"):
+        self.video_path = video_path
+        self.output_dir = output_dir
+        self.frames_dir = frames_dir
+        self.depth_dir = depth_dir
+        
+        self.detector = EnhancedCollisionDetector()
+        self.segmenter = AccurateSegmenter()
+        
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(frames_dir, exist_ok=True)
+        os.makedirs(depth_dir, exist_ok=True)
+        
+        # Progress tracking variables
+        self.start_time = None
+        self.processed_frames = 0
+        self.total_frames = 0
 
-def process_frames(frame_dir, output_dir, map_output_dir, depth_output_dir):
-    if not os.path.exists(frame_dir) or not os.listdir(frame_dir):
-        print("❌ Error: No frames found in the 'frames' directory. Exiting process.")
-        return
+    def _frames_exist(self):
+        return len([f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')]) > 0
+    
+    def _get_processed_frames(self):
+        """Get set of frame indices that have already been processed"""
+        processed = set()
+        for f in os.listdir(self.output_dir):
+            if f.startswith('frame_') and f.endswith('.jpg'):
+                try:
+                    frame_idx = int(f[6:-4])  # Extract number from 'frame_XXXXX.jpg'
+                    processed.add(frame_idx)
+                except ValueError:
+                    continue
+        return processed
 
-    # Ensure output directories exist
-    for dir_path in [output_dir, map_output_dir, depth_output_dir]:
-        if not os.path.exists(dir_path):
-            os.makedirs(dir_path)
+    def _extract_frames(self, target_fps=6):
+        cap = cv2.VideoCapture(self.video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(round(fps / target_fps))
+        
+        frame_idx = 0
+        saved_count = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+            
+            if frame_idx % frame_interval == 0:
+                cv2.imwrite(os.path.join(self.frames_dir, f"frame_{saved_count:05d}.jpg"), frame)
+                saved_count += 1
+            frame_idx += 1
+        
+        cap.release()
+        print(f"Extracted {saved_count} frames at {target_fps} FPS")
+        return saved_count
 
-    # Initialize components
-    segmenter = SemanticSegmenter()
-    tracker = ObjectTracker(max_age=5, min_hits=3, iou_threshold=0.3)
-    detector = ObjectDetector()
-    navigator = Navigator()
-    map_gen = MapGenerator(map_size=(800, 800))
+    def _get_depth_map(self, frame, frame_idx):
+        npy_path = os.path.join(self.depth_dir, f"depth_{frame_idx:05d}.npy")
+        if os.path.exists(npy_path):
+            return np.load(npy_path)
+        
+        depth_map = self.detector.get_depth_map(frame)
+        np.save(npy_path, depth_map)
+        
+        # Save visualization
+        depth_vis = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
+        cv2.imwrite(npy_path.replace('.npy', '.jpg'), 
+                   cv2.applyColorMap(depth_vis.astype(np.uint8), cv2.COLORMAP_JET))
+        return depth_map
 
-    # Determine depth map shape from the first frame
-    frame_files = sorted([f for f in os.listdir(frame_dir) if f.endswith('.jpg')])
-    if not frame_files:
-        print("❌ No frames found in the frame directory!")
-        return
-    first_frame_path = os.path.join(frame_dir, frame_files[0])
-    first_frame = cv2.imread(first_frame_path)
-    if first_frame is None:
-        print(f"❌ Failed to load first frame: {first_frame_path}")
-        return
-    frame_height, frame_width = first_frame.shape[:2]
-    depth_map_shape = (frame_height, frame_width)
+    def _get_progress_stats(self):
+        elapsed = time.time() - self.start_time
+        fps = self.processed_frames / elapsed if elapsed > 0 else 0
+        remaining_frames = self.total_frames - self.processed_frames
+        eta = timedelta(seconds=int(remaining_frames / fps)) if fps > 0 else timedelta(0)
+        progress = (self.processed_frames / self.total_frames) * 100
+        
+        return {
+            'processed': self.processed_frames,
+            'total': self.total_frames,
+            'progress': progress,
+            'fps': fps,
+            'elapsed': timedelta(seconds=int(elapsed)),
+            'eta': eta
+        }
 
-    # Initialize CollisionDetector once (outside the loop for efficiency)
-    collision_detector = CollisionDetector(depth_map_shape=depth_map_shape, depth_output_dir=depth_output_dir)
+    def _display_progress(self, stats):
+        progress_bar = f"[{'=' * int(stats['progress']/2):<50}] {stats['progress']:.1f}%"
+        status_line = (f"Processed: {stats['processed']}/{stats['total']} | "
+                      f"FPS: {stats['fps']:.1f} | "
+                      f"Elapsed: {stats['elapsed']} | "
+                      f"ETA: {stats['eta']}")
+        print(f"\r{progress_bar} {status_line}", end='', flush=True)
 
-    # Check existing depth maps in depth_output_dir
-    existing_depth_maps = sorted([f for f in os.listdir(depth_output_dir) if f.endswith('.npy') or f.endswith('.jpg')])
-    depth_map_indices = {int(f.split('_')[1].split('.')[0]): f for f in existing_depth_maps}
-    print(f"✅ Found {len(depth_map_indices)} existing depth maps in {depth_output_dir}")
+    def _get_centroid(self, mask):
+        """Calculate centroid of a mask"""
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        
+        # Get the largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        
+        if M["m00"] == 0:
+            return None
+            
+        cX = int(M["m10"] / M["m00"])
+        cY = int(M["m01"] / M["m00"])
+        return (cX, cY)
 
-    position_history = [(0, "clear")]
-    MIN_BBOX_AREA = 400
-
-    for frame_index, frame_name in enumerate(frame_files):
-        frame_path = os.path.join(frame_dir, frame_name)
-        frame = cv2.imread(frame_path)
-        if frame is None:
-            print(f"⚠️ Warning: Unable to read {frame_name}, skipping.")
-            continue
-
-        # Step 1: Object Detection with ObjectDetector (YOLOv8)
-        detected_objects = detector.detect(frame)
-        detected_objects = [obj for obj in detected_objects if (obj[2][2] - obj[2][0]) * (obj[2][3] - obj[2][1]) > MIN_BBOX_AREA]
-
-        # Prepare detections for ObjectTracker (format: [x1, y1, x2, y2, score])
-        detections = []
-        for obj in detected_objects:
-            _, score, bbox = obj
-            x1, y1, x2, y2 = bbox
-            detections.append([x1, y1, x2, y2, score])
-
-        # Step 2: Segmentation with SemanticSegmenter (PointRend)
-        segmented_frame, _ = segmenter.segment(frame)
-        segmentation_masks = {}
-        for idx, det in enumerate(detected_objects):
-            _, _, bbox = det
-            x1, y1, x2, y2 = map(int, bbox)
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
+    def process_frame(self, frame, frame_idx):
+        try:
+            # Semantic segmentation
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            segmented = self.segmenter.segment(frame_rgb)
+            masks = self.segmenter.get_masks(segmented)
+            
+            # Depth and collision detection
+            depth_map = self._get_depth_map(frame, frame_idx)
+            status, distance, _ = self.detector.check_collision(frame, frame_idx)
+            
+            # Create visualizations
+            semantic_vis = self.segmenter.visualize(frame_rgb, segmented)
+            semantic_vis = cv2.cvtColor(semantic_vis, cv2.COLOR_RGB2BGR)
+            
+            # Add class and distance text at detection locations (without black box)
+            for class_name, (mask, min_distance) in masks.items():
+                if class_name != 'background':
+                    centroid = self._get_centroid(mask)
+                    if centroid:
+                        text = f"{class_name}: {min_distance:.1f}m"
+                        # Draw white text with black outline for visibility
+                        cv2.putText(semantic_vis, text, (centroid[0], centroid[1]), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)  # Black outline (thicker)
+                        cv2.putText(semantic_vis, text, (centroid[0], centroid[1]), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)  # White text
+            
+            # Rest of the visualization code remains the same...
+            depth_vis = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX)
+            depth_vis = cv2.applyColorMap(depth_vis.astype(np.uint8), cv2.COLORMAP_JET)
+            h, w = frame.shape[:2]
+            depth_vis_resized = cv2.resize(depth_vis, (w, h))
+            
+            # Add white ROI box to depth map
+            roi_coords = self.detector._dynamic_roi(frame.shape)
+            x_s, x_e, y_s, y_e = roi_coords
+            cv2.rectangle(depth_vis_resized, (x_s, y_s), (x_e, y_e), (255, 255, 255), 3)
+            
+            # Add status text to depth map
+            status_text = f"{status} | {distance:.1f}m"
+            cv2.putText(depth_vis_resized, status_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Combine views
+            combined = np.hstack((semantic_vis, depth_vis_resized))
+            cv2.imwrite(os.path.join(self.output_dir, f"frame_{frame_idx:05d}.jpg"), combined)
+            
+            # Update progress
+            self.processed_frames += 1
+            stats = self._get_progress_stats()
+            self._display_progress(stats)
+            
+            return combined, status
+            
+        except Exception as e:
+            print(f"\nError processing frame {frame_idx}: {str(e)}")
+            return frame, "ERROR"
+    def run(self):
+        # Initialize progress tracking
+        self.start_time = time.time()
+        
+        if not self._frames_exist():
+            print("Extracting frames...")
+            self.total_frames = self._extract_frames()
+        else:
+            frame_files = sorted([f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')])
+            self.total_frames = len(frame_files)
+        
+        # Get already processed frames
+        processed_frames = self._get_processed_frames()
+        initial_processed = len(processed_frames)
+        self.processed_frames = initial_processed
+        
+        print(f"\nFound {initial_processed} already processed frames. Resuming processing...")
+        print(f"Processing {self.total_frames - initial_processed} remaining frames out of {self.total_frames} total...")
+        
+        frame_files = sorted([f for f in os.listdir(self.frames_dir) if f.endswith('.jpg')])
+        for frame_idx, frame_file in enumerate(frame_files):
+            # Skip already processed frames
+            if frame_idx in processed_frames:
                 continue
-            mask = np.zeros((y2-y1, x2-x1), dtype=np.uint8)  # Placeholder
-            mask[10:-10, 10:-10] = 1  # Dummy mask
-            full_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-            full_mask[y1:y2, x1:x2] = mask
-            segmentation_masks[idx] = full_mask
-
-        # Step 3: Object Tracking with ObjectTracker
-        if detections:
-            tracks, tracked_frame = tracker.update(detections, segmentation_masks, frame)
-        else:
-            print("⚠️ No objects detected, using last known tracked objects.")
-            tracks, tracked_frame = tracker.update(np.empty((0, 5)), {}, frame)
-
-        # Step 4: Depth Map and Collision Detection
-        # Check if a depth map exists for this frame_index
-        depth_map = collision_detector.load_depth_map(frame_index)
-        if depth_map is None:
-            print(f"Generating depth map for frame {frame_index} using original frame...")
-            # Use the original frame for depth estimation, not the segmented one
-            depth_map = collision_detector.generate_depth_map(frame)
-            collision_detector.save_depth_map(depth_map, frame_index)
-        else:
-            print(f"✅ Using existing depth map for frame {frame_index}")
-
-        state, distance = collision_detector.check_collision(depth_map)
-        stop_needed = (state == "STOP")
-
-        # Step 5: Navigation Decision
-        command = "STOP" if stop_needed else "MOVE"
-        navigator.speak(command)
-        direction = "stop" if stop_needed else "straight"
-        position_history.append((frame_index, direction))
-
-        # Step 6: Update Map with MapGenerator
-        map_image = map_gen.update_map(position_history, depth_map, frame)
-        if map_image is None:
-            print("❌ Map image not generated!")
-            map_image = np.zeros((800, 800, 3), dtype=np.uint8)
-
-        # Step 7: Visualize and Save Depth Map
-        depth_vis = collision_detector.visualize_depth(depth_map)
-        if depth_vis is None:
-            print("❌ Depth visualization not generated!")
-            depth_vis = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-        depth_map_resized = cv2.resize(depth_vis, (frame.shape[1], frame.shape[0]))
-
-        # Annotate depth map for display
-        move_stop_text = "STOP - COLLISION RISK" if stop_needed else "MOVE - SAFE PATH"
-        move_stop_color = (0, 0, 255) if stop_needed else (0, 255, 0)
-        cv2.putText(depth_map_resized, move_stop_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, move_stop_color, 2)
-        cv2.putText(depth_map_resized, f"Direction: {direction.upper()}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-
-        # Step 8: Combine RGB frame and depth map
-        final_output = np.hstack((tracked_frame, depth_map_resized))
-
-        # Step 9: Save Outputs
-        cv2.imwrite(os.path.join(output_dir, frame_name), final_output)
-        cv2.imwrite(os.path.join(map_output_dir, f"map_{frame_index:04d}.jpg"), map_image)
-        cv2.imwrite(os.path.join(depth_output_dir, f"depth_{frame_index:04d}.jpg"), depth_map_resized)
-
-        # Step 10: Display
-        cv2.imshow("Annotated Image", final_output)
-        cv2.imshow("Generated Navigation Map", map_image)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-        print(f"✅ Frame {frame_name} processed:")
-        print(f"   - Objects detected: {len(detected_objects)}")
-        print(f"   - Movement: {direction.upper()}")
-        print(f"   - Collision Risk: {'STOP' if stop_needed else 'MOVE'}")
-        print(f"   - Output saved at: {output_dir}/{frame_name}")
-
-    cv2.destroyAllWindows()
+                
+            frame = cv2.imread(os.path.join(self.frames_dir, frame_file))
+            if frame is None: 
+                print(f"\nFailed to read frame {frame_file}")
+                continue
+            
+            vis, status = self.process_frame(frame, frame_idx)
+            cv2.imshow('Navigation System', vis)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+        # Clear progress line and print completion
+        print("\n" + " " * 100 + "\r", end='')  # Clear progress line
+        total_time = timedelta(seconds=int(time.time() - self.start_time))
+        print(f"Processing complete. Total time: {total_time}")
+        print(f"Processed {self.processed_frames - initial_processed} new frames (total {self.processed_frames}/{self.total_frames})")
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process a video with segmentation, tracking, detection, navigation, and collision detection")
-    parser.add_argument("--video", type=str, required=True, help="Path to input video file")
-    args = parser.parse_args()
-    
-    frame_dir = "frames"
-    output_dir = "output"
-    map_output_dir = "map_output"
-    depth_output_dir = "depth_output"
-    
-    extract_frames(args.video, frame_dir, target_fps=6)
-    process_frames(frame_dir, output_dir, map_output_dir, depth_output_dir)
-    
-    print("🎉 All frames processed successfully!")
+    nav = NavigationSystem("test_video.mp4")
+    nav.run()
