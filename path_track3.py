@@ -33,9 +33,9 @@ LK_PARAMS = dict(winSize=(21, 21), maxLevel=3,
 STRAIGHT_THRESHOLD = 0.1
 TURN_THRESHOLD = 0.5
 SMOOTHING_WINDOW = 7
-MIN_TURN_ANGLE = 15  # degrees
+MIN_TURN_ANGLE = 10  # degrees
 MIN_OBSTACLE_ANGLE = 30  # degrees for obstacle avoidance
-TURN_MEMORY = 5
+TURN_MEMORY = 3
 OBSTACLE_MEMORY = 3  # Shorter memory for quick maneuvers
 
 def load_images(folder_path, max_frames):
@@ -65,12 +65,12 @@ def detect_features(img):
     fast = cv2.FastFeatureDetector_create(threshold=FAST_THRESHOLD, nonmaxSuppression=True)
     height, width = img.shape
     
-    # Road region (lower 50%)
+    # Road region (lower 30%)
     road_roi = img[int(height*0.5):height, :]
     road_kps = fast.detect(road_roi, None)
     
-    # Static background (upper 30%, excluding middle 20% which may contain moving objects)
-    bg_roi = img[0:int(height*0.3), :]
+    # Static background (upper 50%, excluding middle 20% which may contain moving objects)
+    bg_roi = img[0:int(height*0.5), :]
     bg_kps = fast.detect(bg_roi, None)
     
     # Adjust keypoint coordinates
@@ -105,52 +105,34 @@ def track_features(img1, img2, points1):
     
     return points1[valid], points2[valid]
 
-def analyze_motion(R, t, motion_history): #, obstacle_history
+def analyze_motion(R, t, motion_history):
     """Enhanced motion analysis with obstacle detection"""
     if R is None or t is None:
         return "straight", 0, False
     
     # Update histories
     motion_history.append((R.copy(), t.copy()))
-    # obstacle_history.append((R.copy(), t.copy()))
     
     # Regular turn detection (longer-term)
     cum_R = np.eye(3)
     for R_hist, _ in motion_history:
         cum_R = R_hist @ cum_R
     
-    # Obstacle avoidance detection (shorter-term)
-    obs_cum_R = np.eye(3)
-    # for R_hist, _ in obstacle_history:
-    #     obs_cum_R = R_hist @ obs_cum_R
-    
     # Convert to axis-angle
     angle_axis, _ = cv2.Rodrigues(cum_R)
-    obs_angle_axis, _ = cv2.Rodrigues(obs_cum_R)
     
     angle = np.linalg.norm(angle_axis)
-    obs_angle = np.linalg.norm(obs_angle_axis)
     
     cum_angle_deg = np.degrees(angle)
-    obs_angle_deg = np.degrees(obs_angle)
-    
-    # Check for obstacle avoidance (sharp, quick turns)
-    is_obstacle = False
-    if obs_angle_deg > MIN_OBSTACLE_ANGLE:
-        is_obstacle = True
-        if obs_angle_axis[1, 0] > 0:
-            return "left", obs_angle_deg, is_obstacle
-        else:
-            return "right", obs_angle_deg, is_obstacle
     
     # Regular turn detection
     if cum_angle_deg > MIN_TURN_ANGLE:
         if angle_axis[1, 0] > 0:
-            return "left", cum_angle_deg, is_obstacle
+            return "left", cum_angle_deg, False
         else:
-            return "right", cum_angle_deg, is_obstacle
+            return "right", cum_angle_deg, False
     
-    return "straight", 0, is_obstacle
+    return "straight", 0, False
 
 def estimate_trajectory(images, frame_files, K, collision_log_path, output_dir="path_track"):
     """Main trajectory estimation with real-time visualization and collision log integration"""
@@ -199,6 +181,7 @@ def estimate_trajectory(images, frame_files, K, collision_log_path, output_dir="
     turn_coords = []
     obstacle_coords = []
     last_saved_path = None
+    prev_positions = deque(maxlen=50)  # Store previous positions for extrapolation
     
     prev_img = images[0]
     prev_points = detect_features(prev_img)
@@ -215,6 +198,51 @@ def estimate_trajectory(images, frame_files, K, collision_log_path, output_dir="
                 if img is not None:
                     cv2.putText(img, "STOP", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
                     cv2.imwrite(output_path, img)
+                
+                # Extrapolate trajectory based on previous 10 frames
+                if len(prev_positions) >= 2:  # Need at least 2 points to compute direction
+                    # Compute average motion vector from previous positions
+                    displacements = []
+                    for j in range(1, len(prev_positions)):
+                        disp = prev_positions[j] - prev_positions[j-1]
+                        displacements.append(disp)
+                    avg_displacement = np.mean(displacements, axis=0)
+                    
+                    # Extrapolate new position
+                    new_position = t_total + avg_displacement.reshape(3, 1)
+                    t_total = new_position
+                    trajectory.append(t_total.copy().flatten())
+                    
+                    # Update visualization
+                    x_coords = [p[0] for p in trajectory]
+                    z_coords = [p[2] for p in trajectory]
+                    
+                    traj_line.set_data(x_coords, z_coords)
+                    current_pos.set_data([t_total[0,0]], [t_total[2,0]])
+                    
+                    if i == 0:
+                        start_marker.set_data([t_total[0,0]], [t_total[2,0]])
+                    
+                    if turn_coords:
+                        turn_markers.set_offsets(turn_coords)
+                    if obstacle_coords:
+                        obstacle_markers.set_offsets(obstacle_coords)
+                    
+                    # Update frame display (keep last frame)
+                    frame_display.set_array(prev_img)
+                    if len(prev_points) > 0:
+                        feature_display.set_data(prev_points[:,0], prev_points[:,1])
+                    
+                    # Adjust view limits
+                    if x_coords and z_coords:
+                        margin = max(5, 0.2 * max(np.ptp(x_coords), np.ptp(z_coords)))
+                        ax1.set_xlim(min(x_coords)-margin, max(x_coords)+margin)
+                        ax1.set_ylim(min(z_coords)-margin, max(z_coords)+margin)
+                    
+                    plt.pause(0.001)  # Small pause to update display
+                    plt.savefig(output_path, bbox_inches='tight')
+                    last_saved_path = output_path
+                
             continue
         elif frame_idx < len(status_list) and status_list[frame_idx-1] == "STOP":  # Resume after STOP
             prev_points = detect_features(prev_img)
@@ -266,6 +294,7 @@ def estimate_trajectory(images, frame_files, K, collision_log_path, output_dir="
         t_total = t_total + R_total @ t
         R_total = R @ R_total
         trajectory.append(t_total.copy().flatten())
+        prev_positions.append(t_total.copy())  # Store position for extrapolation
         
         # Update visualization
         x_coords = [p[0] for p in trajectory]
