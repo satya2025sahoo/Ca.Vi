@@ -29,7 +29,7 @@ class EnhancedCollisionDetector:
             }
             
             model = DepthAnythingV2(**configs[variant])
-            model.load_state_dict(torch.load(f"checkpoints/depth_anything_v2_{variant}.pth"))
+            model.load_state_dict(torch.load(f"models_depth_instance/depth_anything_v2_{variant}.pth"))
             return model.to(self.device).eval()
         except Exception as e:
             raise RuntimeError(f"Depth model loading failed: {str(e)}")
