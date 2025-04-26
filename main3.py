@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 from collision_detector3 import EnhancedCollisionDetector
 from instance_segmenter3 import InstanceSegmenter
-import path_track3
+import path_track
 
 class EnhancedNavigationSystem:
     def __init__(self, video_path="video.mp4", output_dir="output", frames_dir="frames", depth_dir="depth_maps"):
@@ -373,7 +373,7 @@ class EnhancedNavigationSystem:
         
         # Call path_track3
         collision_log_path = os.path.join("output", "frame_status.csv")
-        path_track3.main(frames_folder=self.frames_dir, collision_log_path=collision_log_path)
+        path_track.main(frames_folder=self.frames_dir, collision_log_path=collision_log_path)
         
         if interactive:
             cv2.destroyAllWindows()
